@@ -1,0 +1,339 @@
+---
+title: "Getting a Window into your Black Box Model"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+```{r set-options, echo=FALSE, cache=FALSE}
+options(width = 1500)
+```
+```{r setup, message=FALSE,echo=FALSE,include=FALSE}
+library(dplyr)
+library(h2o)
+library(reshape2)
+library(ggplot2)
+library(DT)
+library(knitr)
+library(kableExtra)
+```
+<br> 
+
+
+This notebook shows how its possible to understand parts of a complex black box model.  Black box models built from decision trees or neural networks may have great predictive power, but can be difficult to explain.  Sometimes, it is necessary to explain how exactly the model is working in a particular situation.  This might come from yourself, your management, or a regulatory body.  This notebook uses the concept of a [Local Interpretable Model-Agnostic Explanation (LIME)](https://www.oreilly.com/learning/introduction-to-local-interpretable-model-agnostic-explanations-lime), to explain a black box model.
+
+Look at the image below.  The wall here represents the surface of your complex black box model.  What LIME does is allow us to create a "window" in a local area to gain insight into that part of the model.  It provides a local explanation.  This is useful if the model incorporates a sensitive categorization, e.g., such as men versus women.  Or it could be important to understand a certain class of predictions, e.g., explaining why loans are being denied.  
+<br>
+<div style="width:250px; height=400px">
+![](images/wall.png)
+</div>  
+Image Credit: https://commons.wikimedia.org/wiki/File:Holy_Trinity_Church,_Takeley_-_nave_north_small_window_and_blocked_window_at_east.jpg
+<br>  
+  
+This notebook has two main goals.  The first is to show how to build the windows or a **local linear surrogate model**, based on a complex global model.  The first example starts with a complex black box global model that predicts career length of all NFL positions.  To explain the predictions for quarterbacks, we build a window or local linear model around predictions for quarterbacks.  The local model can then identify the features that most impact the career length of a quarterback.  Here is a pictorial representation of this process from the article by Hall.  The tables in this example use loans, while our example will use statistics related to American football.:  
+<br>
+<div style="height=200px,width=400px">
+![](https://d3ansictanv2wj.cloudfront.net/figure_14-5a0dc8e45616646fc27e5aa995d70a71.jpg)
+</div>
+Image Credit: https://www.oreilly.com/ideas/ideas-on-interpreting-machine-learning
+<br>  
+The second goal of this notebook is to explain reason codes.   **Reason codes** allow us to understand the factors driving a prediction.  For example, if your complex black box model denies a loan applicant, it could be necessary to explain the basis of that denial.  Or you could be trying to understand why your model misclassified a certain prediction.  To explain these predictions, its useful to understand the features driving a certain prediction.  
+  
+One way to calculate reason codes is using the coefficients from the local linear model. The notebooks walks through this method showing all the code to generate reason codes.  Another way is to rely on the existing lime R package to generate reason codes. The notebook show how you would use that package to get reasons for a classification model.  Here is an example of reason codes used to explain a mushroom's classifier decision:
+
+<br>
+![](https://github.com/marcotcr/lime/raw/master/doc/images/tabular.png)
+<br>
+Image Credit: https://github.com/marcotcr/lime/  
+<br>
+The code for building the surrogate models and creating reason codes is based on [Patrick Hall's](https://github.com/jphall663) [python notebook](https://github.com/jphall663/GWU_data_mining/blob/master/10_model_interpretability/src/lime.ipynb).  
+
+## The NFL data  
+The dataset comes from [Savvas's NFL scraping data tutorial](http://savvastjortjoglou.com/nfl-draft.html), and is available at [data.world](https://data.world/rshah/nfl-career-data).  The data contains the career statistics for about 8000 NFL football players. Since I have a good understanding of American football, I could understand the relationships uncovered by the surrogate models and reason codes.  If you don't have a strong understanding of American football, go ahead and substitute another dataset in this notebook.   
+  
+The datasets includes features on the college the player played at, the position they played, the round they were drafted, the team they played for, and their career statistics.  The last column, named target (scroll to the right on the table), is the length of the player's career in years. A [football glossary](https://www.pro-football-reference.com/about/glossary.htm) can explain all the terms and abbreviations.  Lets start with loading and viewing the data.  
+
+```{r grab_data, warning=FALSE}
+data <- read.csv("https://query.data.world/s/WJhKX-vyU-mRj0ZNVab1apjJBnpBWE", header=TRUE, stringsAsFactors=FALSE)
+data <- na.omit(data)  ##For convenience, we are removing data with NAs
+data <- data %>% mutate (College = as.factor(College), Pos =as.factor(Pos), Tm=as.factor(Tm))
+```
+<br>
+```{r show_data, message=FALSE,warning=FALSE,echo=FALSE}
+DT::datatable(data,rownames = FALSE,
+              extensions = list(Scroller=NULL, FixedColumns=list(leftColumns=2)),
+  options = list(
+    dom = 'T<"clear">lfrtip',
+    columnDefs = list(list(width = '20%', targets = list(2,3,4))),
+    deferRender=TRUE,
+    scrollX=TRUE,scrollY=400,
+    scrollCollapse=TRUE,
+    pageLength = 100, lengthMenu = c(10,50,100,200)
+  ))
+```
+<br>  
+<br>  
+  
+## Modeling the length of a player's career
+  
+The first step is building a model for the length of a player's career.  I am using [h2o](h2o.ai) to build a gradient boosted machine model, but feel free to use another algorithm/tool.  This is the black box model, so it can be complex. The features for the model will include all the information we have about the player.  The target is the duration of a player's career (target column).  For simplicity of illustrating the code, I am just using default values in building the models.  
+  
+```{r build_global_model,results="hide"}
+h2o.init()
+data.h2o <- as.h2o(data)
+splits <- h2o.splitFrame(data.h2o, 0.7, seed=1234)
+train  <- h2o.assign(splits[[1]], "train.hex")
+valid  <- h2o.assign(splits[[2]], "val.hex")
+x = 2:20
+y= 21
+model.gbm <- h2o.gbm(x=x,y=y,
+                  training_frame = train,
+                  validation_frame = valid)
+
+##Get predictions
+h2o.no_progress()
+preds <- h2o.predict(model.gbm,valid)
+preds <- h2o.cbind(preds,valid)
+preds <- as.data.frame(preds) 
+preds <- preds %>% arrange(target)
+```
+  
+The ranked predictions plot below compares the global predictions from our 'black box' model to the actual predictions.   Ideally, the predictions follow the actual values closely.  For this model, the plot shows some variability in the predictions, but you see a general trend for the predictions that follows the actual values.  Another metric that we look at below is the R squared.  After all, the better fit of the global model, the better the model.
+
+```{r local_datasetdf,results="hide"}
+ggplot(data=preds,aes(x=as.numeric(row.names(preds)),y=predict)) + 
+  geom_point(aes(color="predictions",alpha=.1),size=.5) + 
+  stat_smooth(method = "lm", formula = y ~ x, size = 1) + 
+  geom_line(aes(y=target,color="actual")) +
+  ggtitle("Ranked Predictions Plot of the Black Box Model") +
+  xlab("Players") + ylab("Career length")
+```
+
+<br>
+The variable importance plot highlights the features that have the most impact on the length of a career.  The top three features (college, position, and round drafted) apply to all positions and seem to make intuitive sense for assessing the future career of a player.   However, for the QB position, many of the other features like Def_Int, Sk, Rec, Rec_TD do not come into play.  These are statistics earned by other positions, such as defensive players or receivers.  So while this model may perform well according to its R squared value, it doesn't help us understand the features driving individual positions.   This is where LIME comes into play for explaining parts of a model.  
+
+```{r print_vi,echo=FALSE}
+r2 <- h2o.r2(model.gbm)
+paste0("R squared is: ",r2)
+h2o.varimp_plot(model.gbm, num_of_features = NULL)
+#kable(vi, caption = "Global Feature Importance")
+```
+
+## Building a window into your model 
+
+To use LIME, we need to choose a local area of the model (the window).  In this example, I choose the QB position and the resulting dataset is shown below.  I could have easily picked another feature or even part of the target (say for the top 10% longest careers).  Other approaches include using clustering approaches to group related observations (i.e., kmeans) or just choosing nearby points around a particular point.  For those looking for interesting research projects, the selection of a local area could use more investigation and empirical rigor.
+
+```{r local_dataset,results="hide"}
+local_frame <- preds %>% filter (Pos == 'QB')
+```
+<br>
+Local dataset of QBs for building the surrogate model:
+```{r local_dataset_view,echo=FALSE}
+DT::datatable(local_frame,rownames = FALSE,
+              extensions = list(Scroller=NULL, FixedColumns=list(leftColumns=2)),
+  options = list(
+    dom = 'T<"clear">lfrtip',
+    columnDefs = list(list(width = '20%', targets = list(2,3,4))),
+    deferRender=TRUE,
+    scrollX=TRUE,scrollY=400,
+    scrollCollapse=TRUE,
+    pageLength = 100, lengthMenu = c(10,50,100,200)
+  ))
+```
+
+<br>
+One issue when building a linear model is correlated features.  Correlated features can throw off importance measurements. The below code chunk identifies correlated features.
+  
+```{r correlated}
+#First we need to identify the correlated features and remove them
+d <- Filter(is.numeric, data)
+d_cor <- as.matrix(cor(d))
+d_cor_melt <- arrange(melt(d_cor), -abs(value))
+d_cor_melt <- filter(d_cor_melt, value > .8) %>% filter (Var1 != Var2) %>%
+  rename (correlation = value)
+options(knitr.table.format = "html") 
+kable(d_cor_melt, caption = "Correlated features") %>% kable_styling (bootstrap_options = "striped", full_width = F, position = "left")
+```
+  
+Yikes!  The career statistics are strongly correlated.  The best approach is to remove correlated features before building a linear model.  In this case, the following features are removed: Rush_TD, Rec_TD, TD, Att, Cmp, Rush_Yds, Rec_Yds, Yds 
+
+The next step is building our surrogate local linear model.  I am using the glm function in h2o which builds an elastic net generalized linear model.  Its also possible to use other interpretable models that provide coefficients such as a generalized additive model (GAM).
+
+```{r local_model, results="hide",warning=FALSE}
+x = c(3:7,12:13,16,19:21)  #Skips over correlated features
+y= 2
+h2o.no_progress()
+local_frame.h2o <- as.h2o(local_frame)
+local_glm <- h2o.glm(x=x,y='predict',training_frame =local_frame.h2o, lambda_search = TRUE)
+
+#Get predictions
+pred_local <- h2o.predict(local_glm,local_frame.h2o)
+pred_local <- as.data.frame(pred_local)
+local_frame <- preds %>% filter (Pos == 'QB')
+local_frame$predictlocal <- pred_local$predict
+local_frame <- local_frame %>% arrange(predict)
+```
+<br>
+The plot below compares the global predictions from our 'black box' model to the local linear model.   Ideally, the local model follows the global model closely.  However, since the local model is a linear model, it won't be able to fully fit the complex non-linear black box global model.  This plot provides some insight into how well the local model is fitting the global model in this particular area, i.e, quarterbacks in our case.  In this case, the global model is represented by the red dots and the general trend of the local predictions is shown.   Other metrics you can use to ensure the local model is capturing the local area is R squared.  After all, if a local linear model is not a good fit, then we can not trust the interpretation of the local model.
+
+```{r local_performance, message = FALSE}
+ggplot(data=local_frame,aes(x=as.numeric(row.names(local_frame)),y=predictlocal)) + 
+  geom_point(aes(color="linear"),size=1) + 
+  stat_smooth(method = "lm", formula = y ~ x, size = 1) + 
+  geom_point(aes(y=predict,color="global")) +
+  ggtitle("Ranked Predictions Plot of the Local Linear Model") +
+  xlab("Players") + ylab("Career length")
+
+#r2 <- h2o.r2(local_glm)
+#paste0("R squared is: ",r2)
+
+```
+
+## Local feature importance
+With the local model built, we can use its coefficients to start explaining the local area.  Ranking the coefficients provides a feature importance ranking for QBs.  A positive sign means the coefficient is increasing the length of a career and vice versa.
+
+```{r local_vi}
+imp <- h2o.varimp(local_glm)
+imp <- imp %>% filter (coefficients>0) %>% mutate(coefficients=round(coefficients,3))
+imp$names <- sub("College.","",imp$names)
+imp$names <- sub("Tm.","",imp$names)
+#h2o.varimp_plot(local_glm, num_of_features = NULL)
+kable(imp, caption = "Local Feature Importance for QBs") %>% kable_styling (bootstrap_options = "striped", full_width = F, position = "left")
+```
+  
+The results here differ from the global feature importance.   The top features like interceptions and the round they were drafted make intuitive sense.  The results for colleges also offer a lot of fodder for assessing quarterbacks.  Quarterbacks looking for a long NFL career should consider Washington State or Arizona State and avoid Texas El-Paso (sorry Paydirt Pete).  
+
+
+## Reason codes  
+
+Reason codes are the factors affecting a particular prediction.  This calculation starts with the prediction for a particular player.  The code below selects a player and shows their data.  The fields include the actual length of their career (target), the global prediction (predict), and the local prediction in the QB area (localpredict).  
+
+```{r rc_player_select}
+row = 109 # select a row to describe #20
+local_frame[row,]
+```
+
+The next step is multiplying the local feature importance coefficients against the actual values.  The code below includes a few data wrangling steps.  
+
+```{r predict_rc,results="hide",warning=FALSE}
+df <- as.data.frame(t(local_frame[row,]))
+df1 <- df %>% tibble::rownames_to_column() %>%  #
+          mutate (names=rowname)
+colnames(df1)[2] <- "player"
+df1$player <- as.character(df1$player)
+df1[3,'names'] <-df1[3,'player'] #Copy Team over to names
+df1[5,'names'] <-df1[5,'player'] #Copy College over to names
+df1 <- df1 %>% 
+        left_join(imp,by='names') %>% #Join local feature importance by names
+        filter (!is.na(sign)) %>%  #Remove non matches
+        mutate (player = as.numeric(player)) %>% 
+        mutate (player = ifelse (is.na(player),1,player)) %>% #Account for characters 
+        mutate (strength = player*coefficients) %>% 
+        mutate (strength = ifelse(sign=="NEG",strength*-1,strength)) %>% 
+        filter (round(strength,1)!=0)
+```
+
+The table below is used for determining the reason codes.  Multiplying the actual player statistics against the coefficient of the linear model gives the strength for that feature.  For example, if the career average by season for interceptions is 10 and the coefficient for interceptions is 1.7, then the strength of that reason code would be 17.  This is then calculated for all the features and plotted below.
+
+```{r show_predict_rc, echo=FALSE,message=FALSE}
+kable(df1, caption = "Reason Codes Table",padding=0) %>% kable_styling (bootstrap_options = "striped", full_width = F, position = "left")
+#(paste0("Sum of local contributions: ",sum(round(df1$score,1))))
+
+ggplot(data=df1,aes(x=rowname,y=strength,fill=sign)) + 
+  geom_bar(stat="identity") +
+  ylab("") +xlab("") + ggtitle(paste0("Local Contributions for ",row))
+```
+
+Now we have reasons for an individual prediction! This allows us to understand the effects of different features on the prediction.  In this case, interceptions is the strongest feature driving the length of a career.  Try this with different players, for example, quarterback with a short career duration, say row 10.  Try this with other local areas other than QB  . . . look at a popular college team or the players with the shortest predicted career.  The key is now we have insights at the level of predictions.
+<br>
+
+## The LIME package in R  
+
+For those unwilling to roll their own reason codes, there are several packages available that can provide reason codes. I will walk through the [lime package](https://github.com/thomasp85/lime) available in R ported over by Thomas Lin Pederson.  This package is still early in its development, so it doesn't cover regression models.  The first step is turning the dataset into a classification problem.  This is done by changing our target for a NFL career to greater than three years versus three or fewer years. 
+ 
+```{r lime_data, message=FALSE,warning=FALSE,results="hide"}
+library(lime)
+library(randomForest)
+library(caret)
+data <- data %>%  dplyr::select (-Rush_TD,-Rec_TD,-TD,-Att,-Cmp,-Rush_Yds,-Rec_Yds,-Yds,-College)
+data$target <- ifelse(data$target>3,1,0)  
+data$target <- as.factor(data$target)
+```
+<br>
+The next step is building a model that is compatible with the lime package.  I used the randomForest package.  I also had to drop the college feature, because the randomForest package can't handle 400 categories.  This model serves as our global "black box" model.
+
+```{r build_model,warnings=FALSE}
+smp_size <- floor(0.75 * nrow(data))
+## set the seed to make your partition reproductible
+set.seed(123)
+train_ind <- sample(seq_len(nrow(data)), size = smp_size)
+train <- data[train_ind,]
+valid <- data[-train_ind, ]
+
+train_lab <- train$target
+train <- train %>% dplyr::select (-target)
+
+##Model can take over an hour to run
+#model <- train(train[,2:11], train_lab, method = 'rf')
+#save(model, file = "RF_NFL_R.rda")
+load(file = "RF_NFL.rda")  
+#Can a copy of RF_NFL.rda at https://www.dropbox.com/s/7phbsg13wv2b00j/RF_NFL_R.rda?dl=0
+```
+<br>
+The next step is running the explain part of lime package.  The explain part builds a local linear model and calculates out the reason codes.  The local linear model is not built around a specific position, but instead built around each prediction.   Here is the description from the [authors](https://homes.cs.washington.edu/~marcotcr/blog/lime/):
+<br>
+```
+An illustration of this process is given below. The original model's decision function is represented by the blue/pink background, and is clearly nonlinear. The bright red cross is the instance being explained (let's call it X).  We sample perturbed instances around X, and weight them according to their proximity to X (weight here is represented by size).  We get original model's prediction on these perturbed instances, and then learn a linear model (dashed line) that approximates the model well in the vicinity of X.  Note that the explanation in this case is not faithful globally, but it is faithful locally around X.
+```
+<br>
+![pic](https://raw.githubusercontent.com/marcotcr/lime/master/doc/images/lime.png)  
+
+
+```{r explain,warnings=FALSE}
+explain <- lime(train[,2:11], model)
+explanation <- explain(valid[201,2:11], n_labels = 1, n_features = 3)
+valid[201,1]
+plot_features(explanation)
+```
+<br>
+The reason codes here show a strong probability for Class 0, which is a career less than three years.  The reason codes make sense, the player was a late round draft pick, a linebacker, and 22 years old.  Lets do one more example:  
+
+
+```{r explain2,warnings=FALSE}
+explanation <- explain(valid[205,2:11], n_labels = 1, n_features = 3)
+valid[205,1]
+plot_features(explanation)
+```
+<br>
+The reason codes show a good probability that the player is in Class 1, which is a career more than three years.  The reason codes make sense, the player was an early draft pick and a quarterback.  In this case, being 22 years old actually lowers the career length.   These examples illustrate the insights reason provide into the factors driving a particular prediction.  
+
+
+## Next steps 
+Once you work through the code here, you should have a good understanding of how to use a linear surrogate model to get reason codes. Moving forward, try taking these ideas to get a window into your black box models.  Here are some ideas to try:  
+- Improve the models by adding a grid search for hyperparameters  
+- Convert the NFL dataset into a classification problem and run your own reason codes   
+- Try different sorts of local areas and compare the results  
+- Try different sorts of interpretable algorithms for modeling the local area, e.g., GAMs  
+- Try this with another dataset  
+- Wrap reason codes in a shiny app and use this to explain a model  
+- Let me know if you found this useful   
+
+## Further Reading  
++ [Audio of Guestrin on LIME](https://twimlai.com/twiml-talk-7-carlos-guestrin-explaining-predictions-machine-learning-models/)  
++ [“Why Should I Trust You?”: Explaining the Predictions of Any Classifier](https://arxiv.org/abs/1602.04938)  
++ [LIME – Local Interpretable Model-Agnostic Explanations](https://homes.cs.washington.edu/~marcotcr/blog/lime/)  
++ [Python LIME package](https://github.com/marcotcr/lime)  
++ [R LIME page](https://github.com/thomasp85/lime)  
++ [Skater python model agnostic interpretation package](https://github.com/datascienceinc/Skater)  
++ [eli5 - python LIME for text classification](https://pypi.python.org/pypi/eli5)   
+
+<br>
+
+## Credits  
+You can find a copy of this notebook in this repo on my github, [inter-examples](https://github.com/rajshah4/inter-examples). For more about me, check out my [website](http://www.rajivshah.com) or find me on [twitter](https://twitter.com/rajcs4).   
+
+Thanks to Will, Patrick, and Rob for their detailed comments. 
+
+
+<br>
