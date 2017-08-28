@@ -210,8 +210,9 @@ The results here differ from the global feature importance.   The top features l
 Reason codes are the factors affecting a particular prediction.  This calculation starts with the prediction for a particular player.  The code below selects a player and shows their data.  The fields include the actual length of their career (target), the global prediction (predict), and the local prediction in the QB area (localpredict).  
 
 ```{r rc_player_select}
-row = 109 # select a row to describe #20
+row = 108 # select a row to describe #20
 local_frame[row,]
+playername <- local_frame$Player[row]
 ```
 
 The next step is multiplying the local feature importance coefficients against the actual values.  The code below includes a few data wrangling steps.  
@@ -242,7 +243,7 @@ kable(df1, caption = "Reason Codes Table",padding=0) %>% kable_styling (bootstra
 
 ggplot(data=df1,aes(x=rowname,y=strength,fill=sign)) + 
   geom_bar(stat="identity") +
-  ylab("") +xlab("") + ggtitle(paste0("Local Contributions for ",row))
+  ylab("") +xlab("") + ggtitle(paste0("Local Contributions for ",playername))
 ```
 
 Now we have reasons for an individual prediction! This allows us to understand the effects of different features on the prediction.  In this case, interceptions is the strongest feature driving the length of a career.  Try this with different players, for example, quarterback with a short career duration, say row 10.  Try this with other local areas other than QB  . . . look at a popular college team or the players with the shortest predicted career.  The key is now we have insights at the level of predictions.
